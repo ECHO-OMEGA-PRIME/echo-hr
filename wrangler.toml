@@ -1,0 +1,26 @@
+name = "echo-hr"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[observability]
+enabled = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "echo-hr"
+database_id = "f88a3be9-4846-4cec-a093-d3d5d94e7d57"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "4b466f0b3c5341b3a9da3149d06337e3"
+
+[[services]]
+binding = "ENGINE_RUNTIME"
+service = "echo-engine-runtime"
+
+[[services]]
+binding = "SHARED_BRAIN"
+service = "echo-shared-brain"
+
+[triggers]
+crons = ["0 5 * * *"]
