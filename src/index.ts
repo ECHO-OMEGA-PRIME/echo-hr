@@ -207,10 +207,19 @@ app.post('/leave-requests/:id/approve', async (c) => {
   const b = sanitizeBody(await c.req.json()); const id = c.req.param('id'); const t = tid(c);
   const req = await c.env.DB.prepare('SELECT * FROM leave_requests WHERE id=? AND tenant_id=?').bind(id, t).first() as any;
   if (!req) return json({ error: 'Not found' }, 404);
-  await c.env.DB.batch([
-    c.env.DB.prepare("UPDATE leave_requests SET status='approved',approved_by=?,approved_at=datetime('now') WHERE id=?").bind(b.approved_by||'system', id),
-    c.env.DB.prepare('UPDATE leave_balances SET used=used+? WHERE employee_id=? AND leave_type_id=? AND year=?').bind(req.days, req.employee_id, req.leave_type_id, new Date(req.start_date).getFullYear()),
+  // Use conditional UPDATE to prevent race condition — only deduct if sufficient balance
+  const year = new Date(req.start_date).getFullYear();
+  const results = await c.env.DB.batch([
+    c.env.DB.prepare("UPDATE leave_requests SET status='approved',approved_by=?,approved_at=datetime('now') WHERE id=? AND status='pending'").bind(b.approved_by||'system', id),
+    c.env.DB.prepare('UPDATE leave_balances SET used=used+? WHERE employee_id=? AND leave_type_id=? AND year=? AND (entitled + carried_over + adjustment - used) >= ?').bind(req.days, req.employee_id, req.leave_type_id, year, req.days),
   ]);
+  // Check if balance deduction succeeded (rows affected > 0)
+  const balResult = results[1] as D1Result;
+  if (!balResult.meta?.changes) {
+    // Rollback approval if balance was insufficient
+    await c.env.DB.prepare("UPDATE leave_requests SET status='pending',approved_by=NULL,approved_at=NULL WHERE id=?").bind(id).run();
+    return json({ error: 'Insufficient leave balance — concurrent approval detected', approved: false }, 409);
+  }
   return json({ approved: true });
 });
 app.post('/leave-requests/:id/reject', async (c) => {
