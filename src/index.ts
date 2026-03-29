@@ -1,11 +1,11 @@
 /**
- * Echo HR v1.0.0 — AI-Powered Employee & HR Management System
+ * Echo HR v2.0.0 — AI-Powered Employee & HR Management System
  * Cloudflare Worker with Hono, D1, KV, service bindings
  */
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 
-interface Env { DB: D1Database; CACHE: KVNamespace; ENGINE_RUNTIME: Fetcher; SHARED_BRAIN: Fetcher; ECHO_API_KEY?: string; }
+interface Env { DB: D1Database; CACHE: KVNamespace; ENGINE_RUNTIME: Fetcher; SHARED_BRAIN: Fetcher; ECHO_API_KEY?: string; STRIPE_SECRET_KEY?: string; STRIPE_WEBHOOK_SECRET?: string; }
 interface RLState { c: number; t: number }
 
 const app = new Hono<{ Bindings: Env }>();
@@ -30,9 +30,41 @@ const tid = (c: any) => c.req.header('X-Tenant-ID') || c.req.query('tenant_id') 
 const json = (d: unknown, s = 200) => new Response(JSON.stringify(d), { status: s, headers: { 'Content-Type': 'application/json' } });
 
 function slog(level: 'info' | 'warn' | 'error', msg: string, data?: Record<string, unknown>) {
-  const entry = { ts: new Date().toISOString(), level, worker: 'echo-hr', version: '1.0.0', msg, ...data };
+  const entry = { ts: new Date().toISOString(), level, worker: 'echo-hr', version: '2.0.0', msg, ...data };
   if (level === 'error') console.error(JSON.stringify(entry));
   else console.log(JSON.stringify(entry));
+}
+
+const HR_PLANS = [
+  { id: 'hr_starter', name: 'HR Starter', price: 1900, currency: 'usd', interval: 'month', employees: 25, features: ['Employee directory','Time tracking','Leave management','Basic payroll','Email support'] },
+  { id: 'hr_professional', name: 'HR Professional', price: 7900, currency: 'usd', interval: 'month', employees: 100, features: ['Everything in Starter','Performance reviews','Onboarding workflows','Document management','Analytics dashboard','AI retention risk','Priority support'] },
+  { id: 'hr_enterprise', name: 'HR Enterprise', price: 19900, currency: 'usd', interval: 'month', employees: -1, features: ['Everything in Professional','Unlimited employees','Multi-department org charts','Advanced payroll','Custom onboarding templates','AI performance insights','Dedicated account manager','SSO & API access'] },
+];
+
+async function verifyStripeSignature(payload: string, sigHeader: string, secret: string): Promise<boolean> {
+  try {
+    const parts = sigHeader.split(',');
+    let timestamp = ''; let signatures: string[] = [];
+    for (const part of parts) {
+      const [k, v] = part.split('=');
+      if (k === 't') timestamp = v;
+      else if (k === 'v1') signatures.push(v);
+    }
+    if (!timestamp || signatures.length === 0) return false;
+    const age = Math.abs(Date.now() / 1000 - parseInt(timestamp));
+    if (age > 300) return false;
+    const enc = new TextEncoder();
+    const key = await crypto.subtle.importKey('raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    const signed = await crypto.subtle.sign('HMAC', key, enc.encode(`${timestamp}.${payload}`));
+    const expected = Array.from(new Uint8Array(signed)).map(b => b.toString(16).padStart(2, '0')).join('');
+    for (const sig of signatures) {
+      if (sig.length !== expected.length) continue;
+      let mismatch = 0;
+      for (let i = 0; i < sig.length; i++) mismatch |= sig.charCodeAt(i) ^ expected.charCodeAt(i);
+      if (mismatch === 0) return true;
+    }
+    return false;
+  } catch { return false; }
 }
 
 async function rateLimit(kv: KVNamespace, key: string, limit: number, windowSec = 60): Promise<boolean> {
@@ -48,7 +80,7 @@ async function rateLimit(kv: KVNamespace, key: string, limit: number, windowSec 
 
 app.use('*', async (c, next) => {
   const path = new URL(c.req.url).pathname;
-  if (path === '/health' || path === '/status') return next();
+  if (path === '/health' || path === '/status' || path.startsWith('/webhooks/')) return next();
   const ip = c.req.header('cf-connecting-ip') || 'unknown';
   const isWrite = ['POST','PUT','PATCH','DELETE'].includes(c.req.method);
   if (await rateLimit(c.env.CACHE, `${ip}:${isWrite ? 'w' : 'r'}`, isWrite ? 60 : 200)) return json({ error: 'Rate limited' }, 429);
@@ -59,7 +91,7 @@ app.use('*', async (c, next) => {
 app.use('*', async (c, next) => {
   const method = c.req.method;
   const path = new URL(c.req.url).pathname;
-  if (method === 'GET' || method === 'OPTIONS' || method === 'HEAD' || path === '/health' || path === '/status') return next();
+  if (method === 'GET' || method === 'OPTIONS' || method === 'HEAD' || path === '/health' || path === '/status' || path.startsWith('/webhooks/')) return next();
   const apiKey = c.req.header('X-Echo-API-Key') || '';
   const bearer = (c.req.header('Authorization') || '').replace('Bearer ', '');
   const expected = c.env.ECHO_API_KEY;
@@ -69,8 +101,8 @@ app.use('*', async (c, next) => {
   return next();
 });
 
-app.get('/', (c) => c.json({ service: 'echo-hr', version: '1.0.0', status: 'operational' }));
-app.get('/health', (c) => json({ status: 'ok', service: 'echo-hr', version: '1.0.0', time: new Date().toISOString() }));
+app.get('/', (c) => c.json({ service: 'echo-hr', version: '2.0.0', status: 'operational' }));
+app.get('/health', (c) => json({ status: 'ok', service: 'echo-hr', version: '2.0.0', stripe: !!c.env.STRIPE_SECRET_KEY, time: new Date().toISOString() }));
 
 // ═══════════════ TENANTS ═══════════════
 app.post('/tenants', async (c) => {
@@ -377,6 +409,95 @@ app.post('/ai/performance-insights', async (c) => {
     const ai = await aiRes.json() as any;
     return json({ stats, insights: ai.response || ai });
   } catch { return json({ insights: 'AI unavailable' }); }
+});
+
+// ═══════════════ STRIPE PAYMENTS ═══════════════
+app.get('/plans', (c) => json({ plans: HR_PLANS.map(p => ({ ...p, price_display: `$${(p.price / 100).toFixed(2)}/mo`, employees_display: p.employees === -1 ? 'Unlimited' : `Up to ${p.employees}` })) }));
+
+app.post('/webhooks/stripe', async (c) => {
+  const body = await c.req.text();
+  const sig = c.req.header('stripe-signature') || '';
+  const secret = c.env.STRIPE_WEBHOOK_SECRET;
+  if (secret) {
+    const valid = await verifyStripeSignature(body, sig, secret);
+    if (!valid) { slog('warn', 'Stripe webhook signature verification failed'); return json({ error: 'Invalid signature' }, 400); }
+  }
+  const event = JSON.parse(body);
+  slog('info', 'Stripe webhook received', { type: event.type, id: event.id });
+  try {
+    await c.env.DB.prepare('INSERT INTO stripe_events (id, type, data, created_at) VALUES (?, ?, ?, datetime(\'now\'))').bind(event.id, event.type, body).run();
+  } catch { /* duplicate event — idempotent */ }
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const tenantId = session.metadata?.tenant_id || session.client_reference_id;
+    const planId = session.metadata?.plan_id;
+    if (tenantId) {
+      const plan = HR_PLANS.find(p => p.id === planId);
+      await c.env.DB.prepare("UPDATE tenants SET plan=?, stripe_customer_id=?, stripe_subscription_id=?, max_employees=?, updated_at=datetime('now') WHERE id=?").bind(planId || 'hr_starter', session.customer, session.subscription, plan?.employees || 25, tenantId).run();
+      slog('info', 'Tenant upgraded via Stripe', { tenant_id: tenantId, plan: planId, customer: session.customer });
+    }
+  } else if (event.type === 'customer.subscription.deleted') {
+    const sub = event.data.object;
+    const tenant = await c.env.DB.prepare('SELECT id FROM tenants WHERE stripe_subscription_id=?').bind(sub.id).first() as any;
+    if (tenant) {
+      await c.env.DB.prepare("UPDATE tenants SET plan='free', stripe_subscription_id=NULL, max_employees=5, updated_at=datetime('now') WHERE id=?").bind(tenant.id).run();
+      slog('info', 'Tenant downgraded — subscription deleted', { tenant_id: tenant.id, sub: sub.id });
+    }
+  }
+  return json({ received: true });
+});
+
+app.post('/plans/upgrade', async (c) => {
+  const b = await c.req.json() as { plan_id: string; tenant_id: string; success_url?: string; cancel_url?: string };
+  if (!c.env.STRIPE_SECRET_KEY) return json({ error: 'Stripe not configured' }, 503);
+  const plan = HR_PLANS.find(p => p.id === b.plan_id);
+  if (!plan) return json({ error: 'Invalid plan', available: HR_PLANS.map(p => p.id) }, 400);
+  const tenant = await c.env.DB.prepare('SELECT * FROM tenants WHERE id=?').bind(b.tenant_id).first() as any;
+  if (!tenant) return json({ error: 'Tenant not found' }, 404);
+  const res = await fetch('https://api.stripe.com/v1/checkout/sessions', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${c.env.STRIPE_SECRET_KEY}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      'mode': 'subscription',
+      'line_items[0][price_data][currency]': plan.currency,
+      'line_items[0][price_data][product_data][name]': `Echo HR — ${plan.name}`,
+      'line_items[0][price_data][product_data][description]': `${plan.employees === -1 ? 'Unlimited' : 'Up to ' + plan.employees} employees. ${plan.features.join(', ')}`,
+      'line_items[0][price_data][unit_amount]': plan.price.toString(),
+      'line_items[0][price_data][recurring][interval]': plan.interval,
+      'line_items[0][quantity]': '1',
+      'metadata[tenant_id]': b.tenant_id,
+      'metadata[plan_id]': plan.id,
+      'client_reference_id': b.tenant_id,
+      'customer_email': tenant.email || '',
+      'success_url': b.success_url || 'https://echo-ept.com/hr/upgrade/success?session_id={CHECKOUT_SESSION_ID}',
+      'cancel_url': b.cancel_url || 'https://echo-ept.com/hr/pricing',
+    }).toString(),
+  });
+  const session = await res.json() as any;
+  if (session.error) { slog('error', 'Stripe checkout creation failed', { error: session.error.message }); return json({ error: session.error.message }, 400); }
+  slog('info', 'Stripe checkout session created', { tenant_id: b.tenant_id, plan: plan.id, session_id: session.id });
+  return json({ checkout_url: session.url, session_id: session.id });
+});
+
+app.post('/admin/migrate-stripe', async (c) => {
+  const results: string[] = [];
+  try {
+    await c.env.DB.prepare(`CREATE TABLE IF NOT EXISTS stripe_events (id TEXT PRIMARY KEY, type TEXT NOT NULL, data TEXT, created_at TEXT DEFAULT (datetime('now')))`).run();
+    results.push('stripe_events table ready');
+  } catch (e: any) { results.push(`stripe_events: ${e.message}`); }
+  const cols = [
+    { name: 'stripe_customer_id', type: 'TEXT' },
+    { name: 'stripe_subscription_id', type: 'TEXT' },
+    { name: 'max_employees', type: 'INTEGER DEFAULT 5' },
+  ];
+  for (const col of cols) {
+    try {
+      await c.env.DB.prepare(`ALTER TABLE tenants ADD COLUMN ${col.name} ${col.type}`).run();
+      results.push(`Added tenants.${col.name}`);
+    } catch { results.push(`tenants.${col.name} already exists`); }
+  }
+  slog('info', 'Stripe migration completed', { results });
+  return json({ migrated: true, results });
 });
 
 // ═══════════════ ACTIVITY LOG ═══════════════
