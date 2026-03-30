@@ -41,6 +41,13 @@ const HR_PLANS = [
   { id: 'hr_enterprise', name: 'HR Enterprise', price: 19900, currency: 'usd', interval: 'month', employees: -1, features: ['Everything in Professional','Unlimited employees','Multi-department org charts','Advanced payroll','Custom onboarding templates','AI performance insights','Dedicated account manager','SSO & API access'] },
 ];
 
+// CORS headers (auto-added by Evolution Engine)
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': 'https://echo-ept.com',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, X-Echo-API-Key',
+};
+
 async function verifyStripeSignature(payload: string, sigHeader: string, secret: string): Promise<boolean> {
   try {
     const parts = sigHeader.split(',');
